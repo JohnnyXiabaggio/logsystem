@@ -1,0 +1,32 @@
+collector:
+  # Paths to log files to tail (can be empty; use --watch flag instead)
+  watch_paths: []
+  poll_interval_sec: 1.0
+  include_system_metrics: true
+  metrics_interval_sec: 30.0
+  source_label: "logsystem"
+
+buffer:
+  max_size: 10000           # max events held in memory before dropping
+  flush_interval_sec: 5.0   # flush to uploader at least this often
+  flush_batch_size: 500     # also flush when this many events accumulate
+
+uploader:
+  endpoint_url: ""          # set via LOGSYS_ENDPOINT env var or --endpoint flag
+  api_key: ""               # set via LOGSYS_API_KEY env var or --api-key flag
+  timeout_sec: 10.0
+  retry_attempts: 4
+  retry_backoff_sec: 2.0    # doubles each attempt: 2s, 4s, 8s, 16s
+  max_batch_size: 500
+  dry_run: true             # set to false to enable real uploads
+
+monitor:
+  error_rate_threshold: 0.10        # alert when >10% of events are ERROR+
+  error_rate_window_sec: 60.0
+  critical_burst_threshold: 5       # alert when 5 CRITICALs in 30s
+  critical_burst_window_sec: 30.0
+  alert_cooldown_sec: 300.0         # minimum 5 minutes between same-type alerts
+  alert_endpoint_url: ""            # set via LOGSYS_ALERT_ENDPOINT env var
+  alert_api_key: ""                 # set via LOGSYS_ALERT_API_KEY env var
+
+log_level: "INFO"
