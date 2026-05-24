@@ -1,13 +1,19 @@
+/**
+ * @file pipeline.h
+ * @brief Top-level orchestration: collector → buffer → uploader + monitor.
+ */
+
 #ifndef PIPELINE_H
 #define PIPELINE_H
 
+#include "logsys_types.h"
 #include "ring_buffer.h"
 #include "collector.h"
 #include "uploader.h"
 #include "monitor.h"
 #include <pthread.h>
 
-#define FLUSH_BATCH 500       /* events per uploader call */
+#define FLUSH_BATCH (200U)
 
 typedef struct {
     RingBuffer  rb;
@@ -15,23 +21,23 @@ typedef struct {
     Uploader    uploader;
     Monitor     monitor;
 
-    /* flush thread */
-    pthread_t        flush_thread;
-    volatile int     running;
-    double           flush_interval_sec;
+    pthread_t       flush_thread;
+    pthread_t       health_thread;
+    volatile bool_t running;
+    bool_t          flush_started;
+    bool_t          health_started;
 
-    /* health-report thread */
-    pthread_t        health_thread;
-    double           health_interval_sec;
+    uint32_t flush_interval_ms;
+    uint32_t health_interval_ms;
 } Pipeline;
 
-/* cfg is shallow — fields copied in */
-int  pipeline_init(Pipeline *p);
-void pipeline_start(Pipeline *p);
-void pipeline_stop(Pipeline *p);
-void pipeline_free(Pipeline *p);
+LogSysErr pipeline_init(Pipeline *p);
+LogSysErr pipeline_start(Pipeline *p);
+LogSysErr pipeline_stop(Pipeline *p);
+LogSysErr pipeline_destroy(Pipeline *p);
 
-/* Block until SIGINT or SIGTERM */
-void pipeline_run_until_signal(Pipeline *p);
+/** Block until SIGINT/SIGTERM is delivered.  Uses sigaction (POSIX,
+ *  safer than ANSI signal). */
+LogSysErr pipeline_run_until_signal(Pipeline *p);
 
 #endif /* PIPELINE_H */

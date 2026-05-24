@@ -1,32 +1,45 @@
+/**
+ * @file uploader.h
+ * @brief Batch HTTP/1.1 POST uploader with exponential-backoff retry.
+ *
+ * Compliance:
+ *   - No dynamic memory; batch JSON built in a file-scope static pool.
+ *   - All return values checked (MISRA 17.7).
+ *   - Integer port range validated (CWE-20).
+ *   - API key never written to a log line (CWE-532).
+ */
+
 #ifndef UPLOADER_H
 #define UPLOADER_H
 
+#include "logsys_types.h"
 #include "log_event.h"
-#include <stddef.h>
-#include <stdint.h>
 
-#define UPLOADER_URL_MAX   512
-#define UPLOADER_KEY_MAX   256
-#define UPLOADER_BATCH_MAX 500
+#define UPLOADER_URL_MAX  (512U)
+#define UPLOADER_KEY_MAX  (256U)
 
 typedef struct {
     char     endpoint[UPLOADER_URL_MAX];
     char     api_key[UPLOADER_KEY_MAX];
-    int      retry_attempts;    /* default 4 */
-    double   backoff_sec;       /* doubles each attempt */
-    double   timeout_sec;
-    int      dry_run;           /* 1 = log locally, no network */
+    uint8_t  retry_attempts;     /* default 4 */
+    uint32_t backoff_ms;         /* doubles each attempt */
+    uint32_t timeout_sec;
+    bool_t   dry_run;            /* TRUE = no network, log only       */
+    bool_t   initialised;
 
-    /* stats (updated under no lock — read only for reporting) */
+    /* Read-only stats. */
     uint64_t total_batches;
     uint64_t total_sent;
     uint64_t total_failed;
 } Uploader;
 
-void uploader_init(Uploader *u);
+LogSysErr uploader_init(Uploader *u);
 
-/* Send a batch of events; handles retry internally.
-   Returns 0 if all events delivered, -1 if permanently failed. */
-int  uploader_send(Uploader *u, const LogEvent *events, size_t count);
+/**
+ * Send a contiguous array of events.  Splits internally into chunks
+ * of at most UPLOADER_BATCH_MAX.
+ * @return LOGSYS_OK if every chunk delivered, LOGSYS_ERR_NET otherwise.
+ */
+LogSysErr uploader_send(Uploader *u, const LogEvent *events, uint32_t count);
 
 #endif /* UPLOADER_H */
