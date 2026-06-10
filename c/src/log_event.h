@@ -92,7 +92,13 @@ LogSysErr json_escape(char *dst, uint32_t cap, const char *src);
 
 LogSysErr evt_init(LogEvent *e, const char *msg, Severity sev, const char *src);
 LogSysErr evt_add_tag(LogEvent *e, const char *k, const char *v);
-LogSysErr evt_to_json(const LogEvent *e, char *buf, uint32_t cap);
+
+/**
+ * Serialise the event as a JSON object into buf.
+ * @param[out] out_len  bytes written (excluding NUL); may be NULL.
+ */
+LogSysErr evt_to_json(const LogEvent *e, char *buf, uint32_t cap,
+                      uint32_t *out_len);
 LogSysErr evt_from_line(const char *line, const char *src, LogEvent *out);
 
 #endif /* LOG_EVENT_H */

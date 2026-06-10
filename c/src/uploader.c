@@ -1,42 +1,32 @@
 /**
  * @file uploader.c
- * @brief Batch HTTP/1.1 POST with retry — plain sockets by default,
- *        optional libcurl backend for HTTPS.
+ * @brief Batch upload with bounded exponential-backoff retry.
  *
- * Cybersecurity controls:
- *   - URL parsed safely; port range validated [1..65535] (CWE-20).
- *   - Authorisation header buffer wiped after send (CWE-316).
- *   - Body buffer is a file-scope static; bounds checked on every write
- *     (CWE-120).
- *   - All system-call return values are checked (CWE-252).
- *   - strtol/strtod used instead of atoi/atol/atof (MISRA 21.7).
+ * Transport lives in http_client.c (shared with the monitor).
+ *
+ * Performance (ECU):
+ *   - Events are serialised DIRECTLY into the static batch buffer —
+ *     no per-event stack staging copy.
+ *   - The batch buffer is log data, not secret material; it is not
+ *     wiped between batches (the bearer token never enters it — the
+ *     Authorization header is built and wiped inside http_client).
  *
  * Functional safety:
- *   - No dynamic memory anywhere (MISRA 21.3).
- *   - Retry loop is bounded by retry_attempts (≤ 16).
- *   - Per-call timeouts enforced via SO_SNDTIMEO / SO_RCVTIMEO.
+ *   - No dynamic memory (MISRA 21.3); batch buffer is file-scope static.
+ *   - Retry loop bounded by retry_attempts; backoff doubling is
+ *     overflow-guarded.
  */
 
 #include "uploader.h"
+#include "http_client.h"
 
 #include <string.h>
 #include <stdio.h>
-#include <stdlib.h>       /* strtol, strtod */
-#include <unistd.h>
 #include <time.h>
-#include <errno.h>
 #include <pthread.h>
 
-#ifdef USE_CURL
-#  include <curl/curl.h>
-#else
-#  include <sys/socket.h>
-#  include <netdb.h>
-#  include <sys/time.h>
-#endif
-
 /* ------------------------------------------------------------------ */
-/* Static batch pool — only sized to one batch at a time              */
+/* Static batch buffer                                                 */
 /* ------------------------------------------------------------------ */
 
 /* Per-event worst-case JSON budget. */
@@ -48,11 +38,11 @@
 /* Cap at 16 MiB to keep .bss bounded on small targets. */
 LOGSYS_STATIC_ASSERT(BATCH_JSON_MAX <= (16U * 1024U * 1024U), batch_size_sane);
 
-static char     s_batch_buf[BATCH_JSON_MAX];
+static char            s_batch_buf[BATCH_JSON_MAX];
 static pthread_mutex_t s_batch_mu = PTHREAD_MUTEX_INITIALIZER;
 
 /* ------------------------------------------------------------------ */
-/* Internal helpers                                                    */
+/* Batch serialisation — events written in place, no staging copy     */
 /* ------------------------------------------------------------------ */
 
 static LogSysErr build_batch_json(const LogEvent *events,
@@ -61,320 +51,59 @@ static LogSysErr build_batch_json(const LogEvent *events,
                                    uint32_t       *out_len)
 {
     LogSysErr rc = LOGSYS_OK;
+    struct timespec now;
+    char            ts[32];
+    int             n;
+    uint32_t        off;
 
-    if ((events == NULL) || (batch_id == NULL) || (out_len == NULL)) {
-        rc = LOGSYS_ERR_PARAM;
+    (void)clock_gettime(CLOCK_REALTIME, &now);
+    if (ts_iso8601(&now, ts, sizeof(ts)) != LOGSYS_OK) {
+        rc = LOGSYS_ERR_TRUNC;
     } else {
-        struct timespec now;
-        char            ts[32];
-        int             n;
-        int32_t         off;
+        n = snprintf(s_batch_buf, BATCH_JSON_MAX,
+            "{\"batch_id\":\"%s\",\"created_at\":\"%s\","
+            "\"event_count\":%u,\"events\":[",
+            batch_id, ts, (unsigned int)count);
 
-        (void)clock_gettime(CLOCK_REALTIME, &now);
-        if (ts_iso8601(&now, ts, sizeof(ts)) != LOGSYS_OK) {
+        if ((n < 0) || ((uint32_t)n >= BATCH_JSON_MAX)) {
             rc = LOGSYS_ERR_TRUNC;
         } else {
-            n = snprintf(s_batch_buf, BATCH_JSON_MAX,
-                "{\"batch_id\":\"%s\",\"created_at\":\"%s\","
-                "\"event_count\":%u,\"events\":[",
-                batch_id, ts, (unsigned int)count);
+            uint32_t i;
+            off = (uint32_t)n;
+            for (i = 0U; (i < count) && (rc == LOGSYS_OK); i++) {
+                uint32_t evt_len = 0U;
 
-            if ((n < 0) || ((uint32_t)n >= BATCH_JSON_MAX)) {
-                rc = LOGSYS_ERR_TRUNC;
-            } else {
-                uint32_t i;
-                off = n;
-                for (i = 0U; (i < count) && (rc == LOGSYS_OK); i++) {
-                    char evj[PER_EVT_BUDGET];
-                    if (evt_to_json(&events[i], evj, sizeof(evj)) != LOGSYS_OK) {
-                        rc = LOGSYS_ERR_TRUNC;
-                    } else if ((uint32_t)off >= BATCH_JSON_MAX) {
+                if (i > 0U) {
+                    if ((off + 1U) >= BATCH_JSON_MAX) {
                         rc = LOGSYS_ERR_TRUNC;
                     } else {
-                        n = snprintf(&s_batch_buf[off],
-                                     (size_t)(BATCH_JSON_MAX - (uint32_t)off),
-                                     "%s%s", (i == 0U) ? "" : ",", evj);
-                        if ((n < 0) ||
-                            ((uint32_t)n >= (BATCH_JSON_MAX - (uint32_t)off))) {
-                            rc = LOGSYS_ERR_TRUNC;
-                        } else {
-                            off += n;
-                        }
+                        s_batch_buf[off] = ',';
+                        off++;
                     }
                 }
                 if (rc == LOGSYS_OK) {
-                    if ((uint32_t)off >= BATCH_JSON_MAX) {
-                        rc = LOGSYS_ERR_TRUNC;
-                    } else {
-                        n = snprintf(&s_batch_buf[off],
-                                     (size_t)(BATCH_JSON_MAX - (uint32_t)off),
-                                     "]}");
-                        if ((n < 0) ||
-                            ((uint32_t)n >= (BATCH_JSON_MAX - (uint32_t)off))) {
-                            rc = LOGSYS_ERR_TRUNC;
-                        } else {
-                            *out_len = (uint32_t)(off + n);
-                        }
+                    rc = evt_to_json(&events[i], &s_batch_buf[off],
+                                     BATCH_JSON_MAX - off, &evt_len);
+                    if (rc == LOGSYS_OK) {
+                        off += evt_len;
                     }
                 }
             }
-        }
-    }
-    return rc;
-}
-
-/* ------------------------------------------------------------------ */
-/* HTTP transport — plain sockets                                      */
-/* ------------------------------------------------------------------ */
-
-#ifndef USE_CURL
-
-/* Single-exit URL parser using strtol for the port (MISRA 21.7, CWE-20). */
-static LogSysErr parse_url(const char *url,
-                            char       *host, uint32_t hcap,
-                            int32_t    *port,
-                            char       *path, uint32_t pcap)
-{
-    LogSysErr rc = LOGSYS_OK;
-
-    if ((url == NULL) || (host == NULL) || (port == NULL) ||
-        (path == NULL) || (hcap == 0U) || (pcap == 0U)) {
-        rc = LOGSYS_ERR_PARAM;
-    } else if (strncmp(url, "http://", 7U) != 0) {
-        rc = LOGSYS_ERR_PARAM;
-    } else {
-        const char *p     = &url[7];
-        const char *slash = strchr(p, '/');
-        const char *colon = strchr(p, ':');
-
-        *port = 80;
-        if (slash != NULL) {
-            const ptrdiff_t plen = slash - p;
-            int             n;
-            n = snprintf(path, (size_t)pcap, "%s", slash);
-            if ((n < 0) || ((uint32_t)n >= pcap)) {
-                rc = LOGSYS_ERR_TRUNC;
-            } else if ((colon != NULL) && (colon < slash)) {
-                const ptrdiff_t hlen = colon - p;
-                if ((hlen <= 0) || ((uint32_t)hlen >= hcap)) {
+            if (rc == LOGSYS_OK) {
+                if ((off + 3U) > BATCH_JSON_MAX) {
                     rc = LOGSYS_ERR_TRUNC;
                 } else {
-                    n = snprintf(host, (size_t)hcap, "%.*s",
-                                 (int)hlen, p);
-                    if ((n < 0) || ((uint32_t)n >= hcap)) {
-                        rc = LOGSYS_ERR_TRUNC;
-                    } else {
-                        char         *endp = NULL;
-                        const long    pv   = strtol(&colon[1], &endp, 10);
-                        if ((endp == &colon[1]) ||
-                            (pv < (long)LOGSYS_PORT_MIN) ||
-                            (pv > (long)LOGSYS_PORT_MAX)) {
-                            rc = LOGSYS_ERR_PARAM;
-                        } else {
-                            *port = (int32_t)pv;
-                        }
-                    }
-                }
-            } else {
-                if ((plen <= 0) || ((uint32_t)plen >= hcap)) {
-                    rc = LOGSYS_ERR_TRUNC;
-                } else {
-                    n = snprintf(host, (size_t)hcap, "%.*s",
-                                 (int)plen, p);
-                    if ((n < 0) || ((uint32_t)n >= hcap)) {
-                        rc = LOGSYS_ERR_TRUNC;
-                    }
-                }
-            }
-        } else {
-            int n;
-            n = snprintf(path, (size_t)pcap, "%s", "/");
-            if ((n < 0) || ((uint32_t)n >= pcap)) {
-                rc = LOGSYS_ERR_TRUNC;
-            } else {
-                n = snprintf(host, (size_t)hcap, "%s", p);
-                if ((n < 0) || ((uint32_t)n >= hcap)) {
-                    rc = LOGSYS_ERR_TRUNC;
+                    s_batch_buf[off] = ']';
+                    off++;
+                    s_batch_buf[off] = '}';
+                    off++;
+                    s_batch_buf[off] = '\0';
+                    *out_len = off;
                 }
             }
         }
     }
     return rc;
-}
-
-static LogSysErr http_post_socket(const char *url, const char *api_key,
-                                   const char *body, uint32_t body_len,
-                                   uint32_t timeout_sec, long *out_status)
-{
-    LogSysErr rc = LOGSYS_OK;
-    char      host[256];
-    char      path[256];
-    int32_t   port;
-
-    if ((url == NULL) || (body == NULL) || (out_status == NULL)) {
-        rc = LOGSYS_ERR_PARAM;
-    } else if (parse_url(url, host, sizeof(host),
-                          &port, path, sizeof(path)) != LOGSYS_OK) {
-        rc = LOGSYS_ERR_PARAM;
-    } else {
-        struct addrinfo  hints;
-        struct addrinfo *res = NULL;
-        char             port_str[8];
-
-        (void)memset(&hints, 0, sizeof(hints));
-        hints.ai_family   = AF_UNSPEC;
-        hints.ai_socktype = SOCK_STREAM;
-        (void)snprintf(port_str, sizeof(port_str), "%d", (int)port);
-
-        if (getaddrinfo(host, port_str, &hints, &res) != 0) {
-            rc = LOGSYS_ERR_NET;
-        } else {
-            int sock = socket(res->ai_family, res->ai_socktype,
-                              res->ai_protocol);
-            if (sock < 0) {
-                rc = LOGSYS_ERR_NET;
-            } else {
-                struct timeval tv;
-                tv.tv_sec  = (time_t)timeout_sec;
-                tv.tv_usec = 0;
-
-                if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO,
-                               &tv, sizeof(tv)) != 0) {
-                    rc = LOGSYS_ERR_NET;
-                } else if (setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO,
-                                       &tv, sizeof(tv)) != 0) {
-                    rc = LOGSYS_ERR_NET;
-                } else if (connect(sock, res->ai_addr, res->ai_addrlen) != 0) {
-                    rc = LOGSYS_ERR_NET;
-                } else {
-                    char hdr[1024];
-                    int  hlen;
-
-                    /* Build the request header.  We deliberately do
-                     * NOT log this buffer anywhere — it contains the
-                     * bearer token (CWE-532). */
-                    hlen = snprintf(hdr, sizeof(hdr),
-                        "POST %s HTTP/1.1\r\n"
-                        "Host: %s\r\n"
-                        "Content-Type: application/json\r\n"
-                        "Content-Length: %u\r\n"
-                        "User-Agent: logsystem-c/1.0\r\n"
-                        "%s%s%s"
-                        "Connection: close\r\n\r\n",
-                        path, host, (unsigned int)body_len,
-                        ((api_key != NULL) && (api_key[0] != '\0'))
-                            ? "Authorization: Bearer " : "",
-                        ((api_key != NULL) && (api_key[0] != '\0'))
-                            ? api_key : "",
-                        ((api_key != NULL) && (api_key[0] != '\0'))
-                            ? "\r\n" : "");
-
-                    if ((hlen < 0) || ((size_t)hlen >= sizeof(hdr))) {
-                        rc = LOGSYS_ERR_TRUNC;
-                    } else {
-                        ssize_t sent_h = send(sock, hdr, (size_t)hlen, 0);
-                        ssize_t sent_b = (sent_h > 0) ?
-                            send(sock, body, body_len, 0) : (ssize_t)-1;
-                        if ((sent_h < 0) || ((size_t)sent_h != (size_t)hlen) ||
-                            (sent_b < 0) || ((size_t)sent_b != body_len)) {
-                            rc = LOGSYS_ERR_NET;
-                        } else {
-                            char    resp[256];
-                            ssize_t got;
-                            (void)memset(resp, 0, sizeof(resp));
-                            got = recv(sock, resp, sizeof(resp) - 1U, 0);
-                            if (got <= 0) {
-                                rc = LOGSYS_ERR_NET;
-                            } else {
-                                const char *sp = strchr(resp, ' ');
-                                if (sp == NULL) {
-                                    *out_status = 0;
-                                    rc          = LOGSYS_ERR_NET;
-                                } else {
-                                    char *endp = NULL;
-                                    long  st   = strtol(&sp[1], &endp, 10);
-                                    if (endp == &sp[1]) {
-                                        rc = LOGSYS_ERR_NET;
-                                    } else {
-                                        *out_status = st;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    /* Wipe the header buffer to remove the bearer token
-                     * from the stack frame before return (CWE-316). */
-                    (void)memset(hdr, 0, sizeof(hdr));
-                }
-                (void)close(sock);
-            }
-            freeaddrinfo(res);
-        }
-    }
-    return rc;
-}
-
-#else /* USE_CURL */
-
-static size_t curl_discard(void *p, size_t sz, size_t nm, void *ud)
-{
-    LOGSYS_UNUSED(p);
-    LOGSYS_UNUSED(ud);
-    return sz * nm;
-}
-
-static LogSysErr http_post_curl(const char *url, const char *api_key,
-                                 const char *body, uint32_t body_len,
-                                 uint32_t timeout_sec, long *out_status)
-{
-    LogSysErr rc   = LOGSYS_OK;
-    CURL     *curl = curl_easy_init();
-
-    if (curl == NULL) {
-        rc = LOGSYS_ERR_NET;
-    } else {
-        struct curl_slist *hdrs = NULL;
-        char               auth[UPLOADER_KEY_MAX + 32U];
-
-        hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
-        hdrs = curl_slist_append(hdrs, "User-Agent: logsystem-c/1.0");
-        if ((api_key != NULL) && (api_key[0] != '\0')) {
-            (void)snprintf(auth, sizeof(auth),
-                           "Authorization: Bearer %s", api_key);
-            hdrs = curl_slist_append(hdrs, auth);
-        }
-
-        (void)curl_easy_setopt(curl, CURLOPT_URL,            url);
-        (void)curl_easy_setopt(curl, CURLOPT_HTTPHEADER,     hdrs);
-        (void)curl_easy_setopt(curl, CURLOPT_POSTFIELDS,     body);
-        (void)curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE,  (long)body_len);
-        (void)curl_easy_setopt(curl, CURLOPT_TIMEOUT,        (long)timeout_sec);
-        (void)curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,  curl_discard);
-
-        if (curl_easy_perform(curl) != CURLE_OK) {
-            rc = LOGSYS_ERR_NET;
-        } else {
-            (void)curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, out_status);
-        }
-        (void)memset(auth, 0, sizeof(auth)); /* CWE-316 */
-        curl_slist_free_all(hdrs);
-        curl_easy_cleanup(curl);
-    }
-    return rc;
-}
-
-#endif /* USE_CURL */
-
-static LogSysErr do_http_post(Uploader *u, const char *body,
-                               uint32_t len, long *status)
-{
-#ifdef USE_CURL
-    return http_post_curl(u->endpoint, u->api_key, body, len,
-                          u->timeout_sec, status);
-#else
-    return http_post_socket(u->endpoint, u->api_key, body, len,
-                            u->timeout_sec, status);
-#endif
 }
 
 /* ------------------------------------------------------------------ */
@@ -417,9 +146,6 @@ LogSysErr uploader_init(Uploader *u)
         u->timeout_sec    = (uint32_t)HTTP_TIMEOUT_SEC;
         u->dry_run        = LOGSYS_FALSE;
         u->initialised    = LOGSYS_TRUE;
-#ifdef USE_CURL
-        (void)curl_global_init(CURL_GLOBAL_DEFAULT);
-#endif
     }
     return rc;
 }
@@ -443,8 +169,8 @@ LogSysErr uploader_send(Uploader *u, const LogEvent *events, uint32_t count)
             const uint32_t chunk  =
                 (remain > UPLOADER_BATCH_MAX) ? UPLOADER_BATCH_MAX : remain;
 
-            char       batch_id[EVT_ID_LEN];
-            uint32_t   body_len;
+            char     batch_id[EVT_ID_LEN];
+            uint32_t body_len = 0U;
             (void)uuid_gen(batch_id, sizeof(batch_id));
 
             if (build_batch_json(&events[off], chunk, batch_id,
@@ -456,7 +182,7 @@ LogSysErr uploader_send(Uploader *u, const LogEvent *events, uint32_t count)
 
                 if ((u->dry_run == LOGSYS_TRUE) ||
                     (u->endpoint[0] == '\0')) {
-                    /* MISRA 21.6 deviation: stderr used for diagnostics. */
+                    /* MISRA 21.6 deviation: stderr diagnostics. */
                     (void)fprintf(stderr,
                         "[uploader] DRY-RUN batch=%.*s events=%u bytes=%u\n",
                         8, batch_id, (unsigned)chunk, (unsigned)body_len);
@@ -474,7 +200,9 @@ LogSysErr uploader_send(Uploader *u, const LogEvent *events, uint32_t count)
                         long      status = 0L;
                         LogSysErr rc;
 
-                        rc = do_http_post(u, s_batch_buf, body_len, &status);
+                        rc = http_post(u->endpoint, u->api_key,
+                                       s_batch_buf, body_len,
+                                       u->timeout_sec, &status);
                         if ((rc == LOGSYS_OK) &&
                             (status >= 200L) && (status < 300L)) {
                             u->total_sent += chunk;
@@ -509,9 +237,6 @@ LogSysErr uploader_send(Uploader *u, const LogEvent *events, uint32_t count)
                     }
                 }
             }
-            /* Wipe the batch buffer between chunks to bound exposure
-             * of message contents in memory dumps (defence in depth). */
-            (void)memset(s_batch_buf, 0, body_len);
         }
         (void)pthread_mutex_unlock(&s_batch_mu);
     }

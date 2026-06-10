@@ -1,5 +1,17 @@
 # Compliance Posture — logsystem (C implementation)
 
+## 0. Performance & latency design (ECU)
+
+| Property | Mechanism |
+|---|---|
+| Issue detection latency | `monitor_observe` runs at INGEST (`pipeline_emit`), before queueing — alerts fire in microseconds, independent of flush cadence and upload health. |
+| Issue delivery latency | Events ≥ ERROR (and watermark occupancy) wake the flush thread immediately via condvar; routine traffic batches on the flush interval. |
+| Sustained throughput | Flush thread drains the ring until empty on every wake (measured: 50,000 events end-to-end in ~1 s, zero drops, dry-run). |
+| Backpressure | Ring full + incoming ≥ ERROR → evict oldest (newest issue event survives); ring full + incoming < ERROR → reject. All drops counted. |
+| Per-event monitor cost | O(1): running window counters maintained on push/evict — no per-event window scan. |
+| Memory | All static (.bss): event pool `RB_CAPACITY × sizeof(LogEvent)`, one batch buffer; the drain batch is static, not a ~213 KB stack frame. Events serialise directly into the batch buffer (no staging copy). |
+| Shutdown latency | Health thread sleeps in 250 ms interruptible steps; flush thread is woken explicitly (`rb_wake`); final drain is bounded. |
+
 This document records how the C implementation satisfies the three
 target standards and lists every documented deviation.
 

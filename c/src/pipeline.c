@@ -2,11 +2,13 @@
  * @file pipeline.c
  * @brief Pipeline implementation.
  *
- * - sigaction (not signal) for SIGINT/SIGTERM (MISRA 21.5 deviation
- *   documented; sigaction is the safer POSIX equivalent).
- * - All pthread return values checked.
- * - All uploader return values captured.
- * - Bounded shutdown drain (max FLUSH_BATCH * 1024 events).
+ * - Monitoring happens at ingest (pipeline_emit), not at flush.
+ * - Flush thread: waits on the ring's urgent wake (or interval
+ *   timeout), then drains until empty — no sustained-throughput
+ *   ceiling from the flush cadence.
+ * - The drain batch is a file-scope static (single flush thread), not
+ *   a ~213 KB stack frame.
+ * - sigaction for SIGINT/SIGTERM; all pthread returns checked.
  */
 
 #include "pipeline.h"
@@ -27,59 +29,77 @@ static void sig_handler(int sig)
     g_stop = 1;
 }
 
+/* Drain staging area: owned exclusively by the flush thread.
+ * Static, not stack — sizeof(LogEvent) * FLUSH_BATCH ≈ 213 KB. */
+static LogEvent s_flush_batch[FLUSH_BATCH];
+
+/* ------------------------------------------------------------------ */
+/* Ingest path                                                         */
+/* ------------------------------------------------------------------ */
+
+LogSysErr pipeline_emit(Pipeline *p, const LogEvent *e)
+{
+    LogSysErr rc;
+
+    if ((p == NULL) || (e == NULL)) {
+        rc = LOGSYS_ERR_PARAM;
+    } else {
+        /* Detection first: an alert must fire even if the queue is
+         * full and the event is subsequently dropped. */
+        (void)monitor_observe(&p->monitor, e);
+        rc = rb_push(&p->rb, e);
+    }
+    return rc;
+}
+
+/* Collector sink trampoline. */
+static LogSysErr emit_sink(void *ctx, const LogEvent *e)
+{
+    return pipeline_emit((Pipeline *)ctx, e);
+}
+
 /* ------------------------------------------------------------------ */
 /* Flush thread                                                        */
 /* ------------------------------------------------------------------ */
 
-static void *flush_thread(void *arg)
+/* Drain the ring until empty.  Bounded: the ring holds at most
+ * RB_CAPACITY events and producers can only re-fill it as fast as the
+ * guard allows. */
+static void drain_all(Pipeline *p)
 {
-    Pipeline *p = (Pipeline *)arg;
-    LogEvent  batch[FLUSH_BATCH];
+    uint32_t guard = (RB_CAPACITY / FLUSH_BATCH) + 2U;
+    uint32_t n_out;
 
-    if (p != NULL) {
-        while (p->running == LOGSYS_TRUE) {
-            struct timespec ts;
-            uint32_t        n_out = 0U;
-            LogSysErr       rc;
-
-            ts.tv_sec  = (time_t)(p->flush_interval_ms / 1000U);
-            ts.tv_nsec = (long)((p->flush_interval_ms % 1000U) * 1000000U);
-            (void)nanosleep(&ts, NULL);
-
-            if (rb_drain(&p->rb, batch, FLUSH_BATCH, &n_out) == LOGSYS_OK) {
-                if (n_out > 0U) {
-                    uint32_t i;
-                    for (i = 0U; i < n_out; i++) {
-                        (void)monitor_observe(&p->monitor, &batch[i]);
-                    }
-                    rc = uploader_send(&p->uploader, batch, n_out);
-                    if (rc != LOGSYS_OK) {
-                        (void)fprintf(stderr,
-                            "[flush] uploader_send returned %d\n", (int)rc);
-                    }
+    do {
+        n_out = 0U;
+        if (rb_drain(&p->rb, s_flush_batch, FLUSH_BATCH,
+                     &n_out) == LOGSYS_OK) {
+            if (n_out > 0U) {
+                if (uploader_send(&p->uploader, s_flush_batch,
+                                  n_out) != LOGSYS_OK) {
+                    (void)fprintf(stderr,
+                        "[flush] uploader_send failed for %u events\n",
+                        (unsigned)n_out);
                 }
             }
         }
+        guard--;
+    } while ((n_out == FLUSH_BATCH) && (guard > 0U));
+}
 
-        /* Final drain on shutdown — bounded by 1024 iterations to
-         * guarantee termination in finite time. */
-        {
-            uint32_t guard = 1024U;
-            uint32_t n_out;
-            do {
-                n_out = 0U;
-                if (rb_drain(&p->rb, batch, FLUSH_BATCH, &n_out) == LOGSYS_OK) {
-                    if (n_out > 0U) {
-                        uint32_t i;
-                        for (i = 0U; i < n_out; i++) {
-                            (void)monitor_observe(&p->monitor, &batch[i]);
-                        }
-                        (void)uploader_send(&p->uploader, batch, n_out);
-                    }
-                }
-                guard--;
-            } while ((n_out > 0U) && (guard > 0U));
+static void *flush_thread(void *arg)
+{
+    Pipeline *p = (Pipeline *)arg;
+
+    if (p != NULL) {
+        while (p->running == LOGSYS_TRUE) {
+            /* Wakes early for ERROR+ events or watermark occupancy;
+             * otherwise times out at the batching interval. */
+            (void)rb_wait_wake(&p->rb, p->flush_interval_ms);
+            drain_all(p);
         }
+        /* Final drain on shutdown. */
+        drain_all(p);
     }
     return NULL;
 }
@@ -94,32 +114,56 @@ static void *health_thread(void *arg)
 
     if (p != NULL) {
         while (p->running == LOGSYS_TRUE) {
-            struct timespec ts;
-            uint32_t        queued    = 0U;
-            uint64_t        rb_in     = 0U;
-            uint64_t        rb_out    = 0U;
-            uint32_t        dropped   = 0U;
-            uint64_t        observed  = 0U;
-            uint64_t        alerts    = 0U;
+            uint32_t queued    = 0U;
+            uint64_t rb_in     = 0U;
+            uint64_t rb_out    = 0U;
+            uint32_t dropped   = 0U;
+            uint64_t observed  = 0U;
+            uint64_t alerts    = 0U;
+            uint64_t alerts_failed = 0U;
+            uint64_t lines_read = 0U;
+            uint64_t lines_dropped = 0U;
+            uint64_t lines_trunc = 0U;
 
-            ts.tv_sec  = (time_t)(p->health_interval_ms / 1000U);
-            ts.tv_nsec = 0;
-            (void)nanosleep(&ts, NULL);
+            /* Interruptible interval sleep: 250 ms granularity so
+             * shutdown does not stall for the full health interval. */
+            {
+                uint32_t remaining = p->health_interval_ms;
+                while ((remaining > 0U) && (p->running == LOGSYS_TRUE)) {
+                    struct timespec ts;
+                    const uint32_t  step =
+                        (remaining > 250U) ? 250U : remaining;
+                    ts.tv_sec  = 0;
+                    ts.tv_nsec = (long)(step * 1000000U);
+                    (void)nanosleep(&ts, NULL);
+                    remaining -= step;
+                }
+            }
+            if (p->running == LOGSYS_FALSE) {
+                break;
+            }
 
             (void)rb_stats(&p->rb, &queued, &rb_in, &rb_out, &dropped);
-            (void)monitor_stats(&p->monitor, &observed, &alerts);
+            (void)monitor_stats(&p->monitor, &observed, &alerts,
+                                &alerts_failed);
+            (void)collector_stats(&p->collector, &lines_read,
+                                  &lines_dropped, &lines_trunc);
 
             (void)fprintf(stderr,
                 "[health] buffer(queued=%u in=%" PRIu64 " out=%" PRIu64
                 " dropped=%u) "
+                "collector(read=%" PRIu64 " dropped=%" PRIu64
+                " truncated=%" PRIu64 ") "
                 "uploader(batches=%" PRIu64 " sent=%" PRIu64
                 " failed=%" PRIu64 ") "
-                "monitor(observed=%" PRIu64 " alerts=%" PRIu64 ")\n",
+                "monitor(observed=%" PRIu64 " alerts=%" PRIu64
+                " alert_failures=%" PRIu64 ")\n",
                 (unsigned)queued, rb_in, rb_out, (unsigned)dropped,
+                lines_read, lines_dropped, lines_trunc,
                 p->uploader.total_batches,
                 p->uploader.total_sent,
                 p->uploader.total_failed,
-                observed, alerts);
+                observed, alerts, alerts_failed);
         }
     }
     return NULL;
@@ -145,7 +189,8 @@ LogSysErr pipeline_init(Pipeline *p)
 
         if (rb_init(&p->rb) != LOGSYS_OK) {
             rc = LOGSYS_ERR_SYS;
-        } else if (collector_init(&p->collector, &p->rb, 1000U) != LOGSYS_OK) {
+        } else if (collector_init(&p->collector, emit_sink, p,
+                                   1000U) != LOGSYS_OK) {
             (void)rb_destroy(&p->rb);
             rc = LOGSYS_ERR_SYS;
         } else if (uploader_init(&p->uploader) != LOGSYS_OK) {
@@ -154,6 +199,8 @@ LogSysErr pipeline_init(Pipeline *p)
         } else if (monitor_init(&p->monitor) != LOGSYS_OK) {
             (void)rb_destroy(&p->rb);
             rc = LOGSYS_ERR_SYS;
+        } else {
+            /* all components initialised */
         }
     }
     return rc;
@@ -180,7 +227,7 @@ LogSysErr pipeline_start(Pipeline *p)
             p->flush_started = LOGSYS_TRUE;
             if (pthread_create(&p->health_thread, NULL,
                                 health_thread, p) != 0) {
-                /* Flush thread is already running — let stop() join it. */
+                /* Flush thread runs — pipeline_stop will join it. */
                 rc = LOGSYS_ERR_SYS;
             } else {
                 p->health_started = LOGSYS_TRUE;
@@ -204,6 +251,9 @@ LogSysErr pipeline_stop(Pipeline *p)
         }
         p->running = LOGSYS_FALSE;
         if (p->flush_started == LOGSYS_TRUE) {
+            /* Unblock the flush thread's timed wait so shutdown does
+             * not stall for a full flush interval. */
+            (void)rb_wake(&p->rb);
             (void)pthread_join(p->flush_thread, NULL);
             p->flush_started = LOGSYS_FALSE;
         }

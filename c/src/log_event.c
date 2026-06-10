@@ -346,10 +346,14 @@ LogSysErr evt_add_tag(LogEvent *e, const char *k, const char *v)
     return rc;
 }
 
-LogSysErr evt_to_json(const LogEvent *e, char *buf, uint32_t cap)
+LogSysErr evt_to_json(const LogEvent *e, char *buf, uint32_t cap,
+                      uint32_t *out_len)
 {
     LogSysErr rc = LOGSYS_OK;
 
+    if (out_len != NULL) {
+        *out_len = 0U;
+    }
     if ((e == NULL) || (buf == NULL) || (cap < 64U)) {
         rc = LOGSYS_ERR_PARAM;
     } else {
@@ -407,6 +411,10 @@ LogSysErr evt_to_json(const LogEvent *e, char *buf, uint32_t cap)
                         n = snprintf(&buf[off], (size_t)(cap - (uint32_t)off), "}}");
                         if ((n < 0) || ((uint32_t)n >= (cap - (uint32_t)off))) {
                             rc = LOGSYS_ERR_TRUNC;
+                        } else if (out_len != NULL) {
+                            *out_len = (uint32_t)off + (uint32_t)n;
+                        } else {
+                            /* caller does not need the length */
                         }
                     }
                 }

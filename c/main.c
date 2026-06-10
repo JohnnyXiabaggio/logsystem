@@ -173,11 +173,18 @@ int main(int argc, char **argv)
                 (void)fprintf(stderr, "pipeline_start failed\n");
                 exit_code = 1;
             } else if (stdin_mode != 0) {
-                char line[EVT_MSG_MAX];
-                while (fgets(line, (int)sizeof(line), stdin) != NULL) {
+                char   line[EVT_MSG_MAX];
+                bool_t truncated = LOGSYS_FALSE;
+                while (collector_read_line(stdin, line, sizeof(line),
+                                           &truncated) == LOGSYS_OK) {
                     LogEvent evt;
                     if (evt_from_line(line, "stdin", &evt) == LOGSYS_OK) {
-                        (void)rb_push(&p.rb, &evt);
+                        if (truncated == LOGSYS_TRUE) {
+                            (void)evt_add_tag(&evt, "truncated", "1");
+                        }
+                        /* Detection at ingest; FULL = backpressure drop
+                         * already counted in rb stats. */
+                        (void)pipeline_emit(&p, &evt);
                     }
                 }
             } else {

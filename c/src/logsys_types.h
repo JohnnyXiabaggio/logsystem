@@ -81,6 +81,12 @@ typedef int32_t LogSysErr;
 #  define MON_WIN_MAX          (512U)
 #endif
 
+/* Ring-buffer occupancy at which rb_push wakes the flush thread even
+ * for low-severity traffic (events >= SEV_ERROR always wake it). */
+#ifndef RB_WAKE_WATERMARK
+#  define RB_WAKE_WATERMARK    (200U)
+#endif
+
 #ifndef HTTP_TIMEOUT_SEC
 #  define HTTP_TIMEOUT_SEC     (10)
 #endif
@@ -108,6 +114,7 @@ LOGSYS_STATIC_ASSERT(COLLECTOR_PATH_MAX  >= 16U,   col_path_min);
 /* Guard against absurd configuration that would exhaust .bss */
 LOGSYS_STATIC_ASSERT(RB_CAPACITY        <= 100000U, rb_cap_sanity);
 LOGSYS_STATIC_ASSERT(UPLOADER_BATCH_MAX <= 10000U,  up_batch_sanity);
+LOGSYS_STATIC_ASSERT(RB_WAKE_WATERMARK  <= RB_CAPACITY, rb_watermark_fits);
 
 /* ------------------------------------------------------------------ */
 /* Helper macros                                                       */

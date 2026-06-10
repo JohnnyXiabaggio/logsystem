@@ -1,11 +1,26 @@
 /**
  * @file ring_buffer.h
- * @brief Bounded MPMC event queue backed by a statically allocated pool.
+ * @brief Bounded event queue backed by a statically allocated pool.
  *
  * Compliance:
  *   - MISRA C:2012 Rule 21.3: no malloc/free — pool is file-scope static.
  *   - IEC 61508: deterministic memory; worst-case capacity = RB_CAPACITY.
- *   - All operations validate inputs and return LogSysErr.
+ *
+ * Backpressure policy (issue events must survive incident storms):
+ *   - Incoming event with severity >= ERROR and a full ring evicts the
+ *     OLDEST queued event to make room (the newest high-severity event
+ *     is the one the cloud most needs).
+ *   - Incoming event below ERROR and a full ring is rejected
+ *     (LOGSYS_ERR_FULL) — low-severity noise never displaces queued data.
+ *
+ * Wake policy (flush latency):
+ *   - rb_push wakes a waiter (rb_wait_wake) when the pushed event has
+ *     severity >= ERROR or occupancy reaches RB_WAKE_WATERMARK.
+ *   - Routine traffic is batched: the flush thread's timed wait simply
+ *     expires after its interval.
+ *
+ * The storage pool is a single static array: only ONE RingBuffer may be
+ * initialised at a time; rb_init enforces this (LOGSYS_ERR_STATE).
  */
 
 #ifndef RING_BUFFER_H
@@ -25,31 +40,38 @@ typedef struct {
     uint64_t        total_in;
     uint64_t        total_out;
     pthread_mutex_t mu;
-    pthread_cond_t  notempty;
+    pthread_cond_t  wake;
+    bool_t          wake_pending;
     bool_t          initialised;
 } RingBuffer;
 
-/**
- * Initialise the ring buffer.  Must be called exactly once before any
- * other operation.  The internal pool is statically allocated and
- * cannot be parameterised at runtime; pass cap == RB_CAPACITY.
- */
+/** Initialise. Fails with LOGSYS_ERR_STATE if another instance owns the
+ *  static pool. */
 LogSysErr rb_init(RingBuffer *rb);
 
-/** Destroy ring buffer resources (mutex + condvar). */
+/** Destroy ring buffer resources and release the static pool. */
 LogSysErr rb_destroy(RingBuffer *rb);
 
 /**
- * Push an event.  Returns LOGSYS_ERR_FULL if the queue is at capacity;
- * the caller MUST observe this return code so dropped events are
- * counted (MISRA 17.7, IEC 61508 fault detection).
+ * Push an event (see backpressure policy above).
+ * @return LOGSYS_OK        accepted (possibly evicting the oldest event)
+ *         LOGSYS_ERR_FULL  rejected: ring full and severity < ERROR
  */
 LogSysErr rb_push(RingBuffer *rb, const LogEvent *e);
 
 /**
+ * Block until an urgent wake arrives or timeout_ms elapses.
+ * @return LOGSYS_OK          woken by rb_push (urgent / watermark)
+ *         LOGSYS_ERR_TIMEOUT timed out (normal batching cadence)
+ */
+LogSysErr rb_wait_wake(RingBuffer *rb, uint32_t timeout_ms);
+
+/** Wake a waiter immediately (e.g. to unblock shutdown). */
+LogSysErr rb_wake(RingBuffer *rb);
+
+/**
  * Drain up to max events into the caller-supplied array.
  * @param[out] out_count  number of events actually drained.
- * @return LOGSYS_OK or LOGSYS_ERR_PARAM.
  */
 LogSysErr rb_drain(RingBuffer *rb, LogEvent *out, uint32_t max,
                    uint32_t *out_count);

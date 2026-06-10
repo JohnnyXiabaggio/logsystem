@@ -1,22 +1,26 @@
 /**
  * @file ring_buffer.c
- * @brief Implementation of the static-pool ring buffer.
+ * @brief Static-pool ring buffer with severity-aware backpressure and
+ *        urgent-wake support.
  *
  * - No dynamic allocation (MISRA 21.3, IEC 61508).
  * - All pthread return values checked (MISRA 17.7, CWE-252).
- * - Single point of exit per function (MISRA 15.5).
+ * - Condvar uses CLOCK_MONOTONIC so wall-clock steps cannot distort the
+ *   flush cadence.
  */
 
 #include "ring_buffer.h"
 #include <string.h>
+#include <errno.h>
+#include <time.h>
 
 /* ------------------------------------------------------------------ */
 /* Static pool — the sole source of LogEvent storage for the queue.   */
-/*                                                                     */
-/* Allocated in .bss; size is fixed at compile time and visible to    */
-/* the linker map (IEC 61508 §7.4.4.7 worst-case memory analysis).    */
+/* s_pool_owner enforces the single-instance contract the static pool */
+/* imposes (the API would otherwise silently alias two "instances").  */
 /* ------------------------------------------------------------------ */
-static LogEvent s_rb_pool[RB_CAPACITY];
+static LogEvent     s_rb_pool[RB_CAPACITY];
+static RingBuffer  *s_pool_owner = NULL;
 
 /* ------------------------------------------------------------------ */
 /* Init / destroy                                                      */
@@ -28,19 +32,35 @@ LogSysErr rb_init(RingBuffer *rb)
 
     if (rb == NULL) {
         rc = LOGSYS_ERR_PARAM;
+    } else if (s_pool_owner != NULL) {
+        rc = LOGSYS_ERR_STATE;      /* pool already owned */
     } else {
+        pthread_condattr_t ca;
+
         (void)memset(rb, 0, sizeof(*rb));
-        rb->pool        = s_rb_pool;
-        rb->cap         = RB_CAPACITY;
-        rb->initialised = LOGSYS_FALSE;
+        rb->pool         = s_rb_pool;
+        rb->cap          = RB_CAPACITY;
+        rb->wake_pending = LOGSYS_FALSE;
+        rb->initialised  = LOGSYS_FALSE;
 
         if (pthread_mutex_init(&rb->mu, NULL) != 0) {
             rc = LOGSYS_ERR_SYS;
-        } else if (pthread_cond_init(&rb->notempty, NULL) != 0) {
+        } else if (pthread_condattr_init(&ca) != 0) {
             (void)pthread_mutex_destroy(&rb->mu);
             rc = LOGSYS_ERR_SYS;
         } else {
-            rb->initialised = LOGSYS_TRUE;
+            if (pthread_condattr_setclock(&ca, CLOCK_MONOTONIC) != 0) {
+                rc = LOGSYS_ERR_SYS;
+            } else if (pthread_cond_init(&rb->wake, &ca) != 0) {
+                rc = LOGSYS_ERR_SYS;
+            } else {
+                rb->initialised = LOGSYS_TRUE;
+                s_pool_owner    = rb;
+            }
+            (void)pthread_condattr_destroy(&ca);
+            if (rb->initialised == LOGSYS_FALSE) {
+                (void)pthread_mutex_destroy(&rb->mu);
+            }
         }
     }
     return rc;
@@ -55,16 +75,19 @@ LogSysErr rb_destroy(RingBuffer *rb)
     } else if (rb->initialised == LOGSYS_FALSE) {
         rc = LOGSYS_ERR_STATE;
     } else {
-        (void)pthread_cond_destroy(&rb->notempty);
+        (void)pthread_cond_destroy(&rb->wake);
         (void)pthread_mutex_destroy(&rb->mu);
         rb->initialised = LOGSYS_FALSE;
         rb->pool        = NULL;
+        if (s_pool_owner == rb) {
+            s_pool_owner = NULL;
+        }
     }
     return rc;
 }
 
 /* ------------------------------------------------------------------ */
-/* Push                                                                */
+/* Push — severity-aware backpressure + urgent wake                    */
 /* ------------------------------------------------------------------ */
 
 LogSysErr rb_push(RingBuffer *rb, const LogEvent *e)
@@ -78,17 +101,110 @@ LogSysErr rb_push(RingBuffer *rb, const LogEvent *e)
     } else if (pthread_mutex_lock(&rb->mu) != 0) {
         rc = LOGSYS_ERR_SYS;
     } else {
+        bool_t do_wake = LOGSYS_FALSE;
+
         if (rb->count >= rb->cap) {
-            rb->dropped++;
-            rc = LOGSYS_ERR_FULL;
-        } else {
+            if (e->severity >= SEV_ERROR) {
+                /* Evict the oldest queued event so the newest issue
+                 * event survives the storm.  The evicted event counts
+                 * as dropped. */
+                rb->head = (rb->head + 1U) % rb->cap;
+                rb->count--;
+                rb->dropped++;
+            } else {
+                rb->dropped++;
+                rc = LOGSYS_ERR_FULL;
+            }
+        }
+
+        if (rc == LOGSYS_OK) {
             rb->pool[rb->tail] = *e;
             rb->tail           = (rb->tail + 1U) % rb->cap;
             rb->count++;
             rb->total_in++;
-            /* Signal failure is recoverable — the timed flush will
-             * drain anyway, so we deliberately ignore the result. */
-            (void)pthread_cond_signal(&rb->notempty);
+
+            if ((e->severity >= SEV_ERROR) ||
+                (rb->count >= RB_WAKE_WATERMARK)) {
+                do_wake = LOGSYS_TRUE;
+            }
+        }
+
+        if ((do_wake == LOGSYS_TRUE) &&
+            (rb->wake_pending == LOGSYS_FALSE)) {
+            rb->wake_pending = LOGSYS_TRUE;
+            /* Signal failure is recoverable: the timed wait expires. */
+            (void)pthread_cond_signal(&rb->wake);
+        }
+        (void)pthread_mutex_unlock(&rb->mu);
+    }
+    return rc;
+}
+
+LogSysErr rb_wake(RingBuffer *rb)
+{
+    LogSysErr rc = LOGSYS_OK;
+
+    if (rb == NULL) {
+        rc = LOGSYS_ERR_PARAM;
+    } else if (rb->initialised == LOGSYS_FALSE) {
+        rc = LOGSYS_ERR_STATE;
+    } else if (pthread_mutex_lock(&rb->mu) != 0) {
+        rc = LOGSYS_ERR_SYS;
+    } else {
+        rb->wake_pending = LOGSYS_TRUE;
+        (void)pthread_cond_signal(&rb->wake);
+        (void)pthread_mutex_unlock(&rb->mu);
+    }
+    return rc;
+}
+
+/* ------------------------------------------------------------------ */
+/* Wait for an urgent wake (or timeout = normal batching cadence)     */
+/* ------------------------------------------------------------------ */
+
+LogSysErr rb_wait_wake(RingBuffer *rb, uint32_t timeout_ms)
+{
+    LogSysErr rc = LOGSYS_OK;
+
+    if (rb == NULL) {
+        rc = LOGSYS_ERR_PARAM;
+    } else if (rb->initialised == LOGSYS_FALSE) {
+        rc = LOGSYS_ERR_STATE;
+    } else if (pthread_mutex_lock(&rb->mu) != 0) {
+        rc = LOGSYS_ERR_SYS;
+    } else {
+        struct timespec deadline;
+
+        (void)clock_gettime(CLOCK_MONOTONIC, &deadline);
+        deadline.tv_sec  += (time_t)(timeout_ms / 1000U);
+        deadline.tv_nsec += (long)((timeout_ms % 1000U) * 1000000U);
+        if (deadline.tv_nsec >= 1000000000L) {
+            deadline.tv_sec  += 1;
+            deadline.tv_nsec -= 1000000000L;
+        }
+
+        {
+            int    wrc     = 0;
+            bool_t expired = LOGSYS_FALSE;
+            /* Bounded by the deadline; loop absorbs spurious wakeups. */
+            while ((rb->wake_pending == LOGSYS_FALSE) &&
+                   (expired == LOGSYS_FALSE)) {
+                wrc = pthread_cond_timedwait(&rb->wake, &rb->mu, &deadline);
+                if (wrc == ETIMEDOUT) {
+                    expired = LOGSYS_TRUE;
+                } else if (wrc != 0) {
+                    expired = LOGSYS_TRUE;   /* treat as timeout */
+                } else {
+                    /* signalled or spurious — loop re-checks predicate */
+                }
+            }
+        }
+
+        if (rb->wake_pending == LOGSYS_TRUE) {
+            rb->wake_pending = LOGSYS_FALSE;
+            rc = LOGSYS_OK;
+        } else {
+            rc = LOGSYS_ERR_TIMEOUT;
         }
         (void)pthread_mutex_unlock(&rb->mu);
     }

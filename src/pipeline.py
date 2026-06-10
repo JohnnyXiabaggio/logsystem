@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import signal
 import sys
+import threading
 from pathlib import Path
 
 from .config import LogSystemConfig, CollectorConfig
@@ -92,7 +93,7 @@ class Pipeline:
 
     def run_until_signal(self) -> None:
         """Block the main thread until SIGINT or SIGTERM is received."""
-        stop_event = __import__("threading").Event()
+        stop_event = threading.Event()
 
         def _handle(signum, frame):
             logger.info("Signal %d received — shutting down", signum)

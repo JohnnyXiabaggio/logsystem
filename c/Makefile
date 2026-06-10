@@ -61,6 +61,7 @@ SRCS   = main.c \
          src/log_event.c \
          src/ring_buffer.c \
          src/collector.c \
+         src/http_client.c \
          src/uploader.c \
          src/monitor.c \
          src/pipeline.c
